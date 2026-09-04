@@ -132,15 +132,25 @@ frame_update_done:
 update_sprite_attr:
         ld hl,SPRITE_ATTR_BASE
         call vram_set_addr_write
+        ; sprite 0: red layer (pattern 0-3)
         ld a,(PLAYER_Y)
         out (VDP_DATA),a
         ld a,(PLAYER_X)
         out (VDP_DATA),a
         xor a
-        out (VDP_DATA),a        ; pattern number 0 (quadrants 0-3)
-        ld a,0x04
-        out (VDP_DATA),a        ; color 4 = dark blue
-        ld a,0xd0               ; terminator for sprite 1 (stop list)
+        out (VDP_DATA),a        ; pattern number 0 (red quadrants 0-3)
+        ld a,0x08
+        out (VDP_DATA),a        ; color 8 = medium red
+        ; sprite 1: white layer (pattern 4-7), same position
+        ld a,(PLAYER_Y)
+        out (VDP_DATA),a
+        ld a,(PLAYER_X)
+        out (VDP_DATA),a
+        ld a,4
+        out (VDP_DATA),a        ; pattern number 4 (white quadrants 0-3)
+        ld a,0x0f
+        out (VDP_DATA),a        ; color 15 = white
+        ld a,0xd0               ; terminator (stop list after 2 sprites)
         out (VDP_DATA),a
         ret
 
@@ -215,14 +225,17 @@ nt_ground_loop:
         ret
 
 ; ------------------------------------------------------------
-; Sprite pattern: a 16x16 placeholder character (4 quadrants at
-; pattern numbers 0-3 in the sprite pattern table, base 0x0800)
+; Sprite pattern: jajamaru, 16x16, built from two overlapping
+; single-color sprites (TMS9918 sprites are always one flat color
+; each): patterns 0-3 = red layer, patterns 4-7 = white layer.
+; Black/cutout areas are simply 0 bits in both layers, showing the
+; background through (per the reference art: red+white, black=cutout).
 ; ------------------------------------------------------------
 load_sprite_pattern:
         ld hl,0x0800
         call vram_set_addr_write
         ld hl,sprite_gfx
-        ld b,32
+        ld b,64
 sprite_gfx_loop:
         ld a,(hl)
         out (VDP_DATA),a
@@ -250,12 +263,19 @@ vdp_init_table:
         db 0x07                  ; R7: backdrop color = cyan
 vdp_init_table_end:
 
-; 16x16 placeholder player sprite, 4 quadrants (top-left, bottom-left,
-; top-right, bottom-right -- TMS9918 16x16 sprite pattern order)
+; jajamaru 16x16 sprite, two 32-byte color layers (4 quadrants each:
+; top-left, bottom-left, top-right, bottom-right). Derived from
+; assets/jajamaru_v6_16x16.png (see tools/sprite_to_asm.py).
 sprite_gfx:
-        db 0x0F,0x1F,0x1F,0x1F,0x1F,0x0F,0x1F,0x3F   ; top-left
-        db 0x3F,0x3F,0x3F,0x3F,0x3C,0x3C,0x3C,0x7C   ; bottom-left
-        db 0xC0,0xE0,0xE0,0xE0,0xE0,0xC0,0xE0,0xF0   ; top-right
-        db 0xF0,0xF0,0xF0,0xF0,0x30,0x30,0x30,0x3E   ; bottom-right
+        ; -- red layer (patterns 0-3) --
+        db 0x01,0x03,0x07,0x0f,0x1f,0x3c,0x58,0x38   ; top-left
+        db 0x3f,0x3f,0x1f,0x1f,0x0f,0x0f,0x33,0x30   ; bottom-left
+        db 0xc0,0xe0,0xf0,0xf8,0xfc,0x1c,0x0c,0x0c   ; top-right
+        db 0xfc,0xfc,0xf8,0xf8,0xf0,0xf0,0xf0,0x00   ; bottom-right
+        ; -- white layer (patterns 4-7) --
+        db 0x00,0x00,0x00,0x00,0x00,0x03,0x04,0x07   ; top-left
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; bottom-left
+        db 0x00,0x00,0x00,0x00,0x00,0xe0,0x40,0xf0   ; top-right
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; bottom-right
 
         ds 0x2000-$,0xff         ; pad to 8KB
