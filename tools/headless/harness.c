@@ -22,7 +22,52 @@ static int vdp_ctrl_second_byte;
 static unsigned char vdp_ctrl_first_byte;
 static unsigned char vdp_read_buffer;
 
-static unsigned char pad1, pad2;
+static unsigned char pad1 = 0xFF, pad2 = 0xFF;
+
+/* Optional scripted input: a sequence of (frame_count, held_pad_value)
+ * phases applied in order as VBlanks occur, so a single headless run can
+ * demonstrate multi-frame movement (e.g. "hold Right for 60 frames, then
+ * Down for 30"). See parse_pad_program(). */
+#define MAX_PHASES 16
+static struct { int frames; unsigned char pad; } pad_program[MAX_PHASES];
+static int pad_program_len = 0;
+static int pad_program_phase = 0;
+static int pad_program_frame_in_phase = 0;
+
+static void pad_program_tick(void) {
+    if (pad_program_len == 0) return;
+    if (pad_program_phase >= pad_program_len) return;
+    pad1 = pad_program[pad_program_phase].pad;
+    pad_program_frame_in_phase++;
+    if (pad_program_frame_in_phase >= pad_program[pad_program_phase].frames) {
+        pad_program_frame_in_phase = 0;
+        pad_program_phase++;
+        if (pad_program_phase >= pad_program_len) pad1 = 0xFF;
+    }
+}
+
+/* Parses e.g. "60R,30D,20L" into phases. Direction letters U/D/L/R map to
+ * the SG-1000 pad1 bits (active low: bit0=Up,1=Down,2=Left,3=Right). */
+static void parse_pad_program(const char *s) {
+    while (s && *s && pad_program_len < MAX_PHASES) {
+        int frames = atoi(s);
+        while (*s >= '0' && *s <= '9') s++;
+        unsigned char pad = 0xFF;
+        while (*s && *s != ',') {
+            switch (*s) {
+                case 'U': pad &= ~0x01; break;
+                case 'D': pad &= ~0x02; break;
+                case 'L': pad &= ~0x04; break;
+                case 'R': pad &= ~0x08; break;
+            }
+            s++;
+        }
+        pad_program[pad_program_len].frames = frames;
+        pad_program[pad_program_len].pad = pad;
+        pad_program_len++;
+        if (*s == ',') s++;
+    }
+}
 
 static Z80EX_BYTE mem_read(Z80EX_CONTEXT *cpu, Z80EX_WORD addr, int m1_state, void *user_data) {
     (void)cpu; (void)m1_state; (void)user_data;
@@ -195,12 +240,19 @@ static void render_screen(void) {
             if (scolor == 0) continue; /* color 0 = transparent, sprite not drawn */
             if (size16) scode &= 0xFC;
             int pat_addr = sprite_pat_base + scode * 8;
-            for (int line = 0; line < dim; line++) {
-                int byte_off = (line < 8) ? line : (line + 8);
-                unsigned char patbyte = vram[(pat_addr + byte_off) & 0x3FFF];
-                for (int bit = 0; bit < 8; bit++) {
-                    if ((patbyte >> (7 - bit)) & 1) {
-                        put_pixel(sx + bit, sy + 1 + line, palette[scolor]);
+            int halves = size16 ? 2 : 1;
+            for (int half = 0; half < halves; half++) {
+                for (int line = 0; line < dim; line++) {
+                    /* Each 8x8 quadrant is 8 contiguous bytes; for 16x16
+                     * sprites the left pair (patterns scode,scode+1) and
+                     * right pair (scode+2,scode+3) are each 16 contiguous
+                     * bytes, so byte_off = half*16 + line walks them. */
+                    int byte_off = half * 16 + line;
+                    unsigned char patbyte = vram[(pat_addr + byte_off) & 0x3FFF];
+                    for (int bit = 0; bit < 8; bit++) {
+                        if ((patbyte >> (7 - bit)) & 1) {
+                            put_pixel(sx + half * 8 + bit, sy + 1 + line, palette[scolor]);
+                        }
                     }
                 }
             }
@@ -217,7 +269,8 @@ static void write_rgb(const char *path) {
 
 int main(int argc, char **argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <rom.sg> <tstates> <out.rgb>\n", argv[0]);
+        fprintf(stderr, "usage: %s <rom.sg> <tstates> <out.rgb> [pad_program]\n", argv[0]);
+        fprintf(stderr, "  pad_program: e.g. \"60R,30D,20L\" (frames+direction letters U/D/L/R)\n");
         return 1;
     }
     FILE *rf = fopen(argv[1], "rb");
@@ -227,6 +280,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "loaded %zu bytes\n", n);
 
     long tstates_target = atol(argv[2]);
+    if (argc >= 5) parse_pad_program(argv[4]);
 
     Z80EX_CONTEXT *cpu = z80ex_create(mem_read, NULL, mem_write, NULL,
                                        port_read, NULL, port_write, NULL,
@@ -241,6 +295,7 @@ int main(int argc, char **argv) {
         if (total - last_vblank >= frame_tstates) {
             last_vblank += frame_tstates;
             vdp_status |= 0x80;
+            pad_program_tick();
             if (vdpreg[1] & 0x20) {
                 z80ex_int(cpu);
             }
