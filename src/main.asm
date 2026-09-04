@@ -33,9 +33,22 @@ MAKI_X          equ 0xc007
 MAKI_Y          equ 0xc008
 MAKI_DIR        equ 0xc009
 
+; enemy 1 = frog (16x16, ground-walking patrol)
+ENEMY1_X        equ 0xc00a
+ENEMY1_DIR      equ 0xc00b      ; 0 = right, 1 = left
+ENEMY1_ACTIVE   equ 0xc00c
+ENEMY1_TIMER    equ 0xc00d      ; respawn countdown while inactive
+
+; enemy 2 = ghost (16x8, floats above the ground, patrols)
+ENEMY2_X        equ 0xc00e
+ENEMY2_DIR      equ 0xc00f
+ENEMY2_ACTIVE   equ 0xc010
+ENEMY2_TIMER    equ 0xc011
+
 SPRITE_ATTR_BASE equ 0x1b00
 
 PLAYER_X_MAX    equ 239   ; 256 - 16 (sprite width) - 1
+PLAYER_START_X  equ 112
 GROUND_Y        equ 160   ; 176 (ground tile top) - 16 (sprite height)
 JUMP_VY         equ 0xf6   ; -10 as two's complement
 GRAVITY         equ 1
@@ -43,6 +56,18 @@ MAX_FALL_VY     equ 4
 MAKI_SPEED      equ 3
 MAKI_X_MIN      equ 0
 MAKI_X_MAX      equ 248
+
+ENEMY1_START_X  equ 40
+ENEMY1_MIN_X    equ 40
+ENEMY1_MAX_X    equ 200
+ENEMY1_Y        equ 160          ; walks on the ground, same Y as the player
+ENEMY_SPEED     equ 1
+RESPAWN_FRAMES  equ 120
+
+ENEMY2_START_X  equ 180
+ENEMY2_MIN_X    equ 60
+ENEMY2_MAX_X    equ 220
+ENEMY2_Y        equ 144          ; floats 16px above the ground
 
         org 0x0000
         di
@@ -89,7 +114,7 @@ clear_loop:
         call load_sprite_pattern
 
         ; initial player/state
-        ld a,112
+        ld a,PLAYER_START_X
         ld (PLAYER_X),a
         ld a,GROUND_Y
         ld (PLAYER_Y),a
@@ -100,6 +125,21 @@ clear_loop:
         ld (MAKI_ACTIVE),a
         ld a,1
         ld (PLAYER_ONGROUND),a
+
+        ld a,ENEMY1_START_X
+        ld (ENEMY1_X),a
+        xor a
+        ld (ENEMY1_DIR),a
+        ld a,1
+        ld (ENEMY1_ACTIVE),a
+
+        ld a,ENEMY2_START_X
+        ld (ENEMY2_X),a
+        ld a,1
+        ld (ENEMY2_DIR),a
+        ld a,1
+        ld (ENEMY2_ACTIVE),a
+
         call update_sprite_attr
 
         ; enable display + VBlank interrupt (R1: 16K=1,BLANK=1,IE=1,SI=1)
@@ -189,6 +229,8 @@ vy_stored:
         ld (PLAYER_ONGROUND),a
 update_maki:
         call update_makibishi
+        call update_enemies
+        call check_collisions
 
         ld a,c
         ld (PAD_PREV),a
@@ -251,6 +293,193 @@ maki_done:
         ret
 
 ; ------------------------------------------------------------
+; Patrol AI for the two enemies: walk back and forth between their
+; min/max X, reversing direction at the bounds. While inactive
+; (just defeated), count down a respawn timer instead.
+; ------------------------------------------------------------
+update_enemies:
+        ld a,(ENEMY1_ACTIVE)
+        or a
+        jr z,e1_respawn_wait
+        ld a,(ENEMY1_DIR)
+        or a
+        jr nz,e1_move_left
+        ld a,(ENEMY1_X)
+        add a,ENEMY_SPEED
+        ld (ENEMY1_X),a
+        cp ENEMY1_MAX_X
+        jr c,e2_start
+        ld a,1
+        ld (ENEMY1_DIR),a
+        jr e2_start
+e1_move_left:
+        ld a,(ENEMY1_X)
+        sub ENEMY_SPEED
+        ld (ENEMY1_X),a
+        cp ENEMY1_MIN_X
+        jr nc,e2_start
+        xor a
+        ld (ENEMY1_DIR),a
+        jr e2_start
+e1_respawn_wait:
+        ld a,(ENEMY1_TIMER)
+        or a
+        jr z,e1_respawn_now
+        dec a
+        ld (ENEMY1_TIMER),a
+        jr e2_start
+e1_respawn_now:
+        ld a,ENEMY1_START_X
+        ld (ENEMY1_X),a
+        ld a,1
+        ld (ENEMY1_ACTIVE),a
+e2_start:
+        ld a,(ENEMY2_ACTIVE)
+        or a
+        jr z,e2_respawn_wait
+        ld a,(ENEMY2_DIR)
+        or a
+        jr nz,e2_move_left
+        ld a,(ENEMY2_X)
+        add a,ENEMY_SPEED
+        ld (ENEMY2_X),a
+        cp ENEMY2_MAX_X
+        jr c,update_enemies_done
+        ld a,1
+        ld (ENEMY2_DIR),a
+        jr update_enemies_done
+e2_move_left:
+        ld a,(ENEMY2_X)
+        sub ENEMY_SPEED
+        ld (ENEMY2_X),a
+        cp ENEMY2_MIN_X
+        jr nc,update_enemies_done
+        xor a
+        ld (ENEMY2_DIR),a
+        jr update_enemies_done
+e2_respawn_wait:
+        ld a,(ENEMY2_TIMER)
+        or a
+        jr z,e2_respawn_now
+        dec a
+        ld (ENEMY2_TIMER),a
+        jr update_enemies_done
+e2_respawn_now:
+        ld a,ENEMY2_START_X
+        ld (ENEMY2_X),a
+        ld a,1
+        ld (ENEMY2_ACTIVE),a
+update_enemies_done:
+        ret
+
+; ------------------------------------------------------------
+; a = X1, b = X2 -> returns with carry set if |X1-X2| < 16
+; (used for both the X and Y axes of the 16x16 overlap test)
+; ------------------------------------------------------------
+overlap16:
+        sub b
+        jp p,ov_abs_done
+        neg
+ov_abs_done:
+        cp 16
+        ret
+
+; ------------------------------------------------------------
+; Makibishi-vs-enemy (defeats the enemy, starts its respawn timer)
+; and player-vs-enemy (knocks the player back to the start) checks.
+; ------------------------------------------------------------
+check_collisions:
+        ld a,(MAKI_ACTIVE)
+        or a
+        jr z,mvse2
+        ld a,(ENEMY1_ACTIVE)
+        or a
+        jr z,mvse2
+        ld a,(MAKI_X)
+        ld b,a
+        ld a,(ENEMY1_X)
+        call overlap16
+        jr nc,mvse2
+        ld a,(MAKI_Y)
+        ld b,a
+        ld a,ENEMY1_Y
+        call overlap16
+        jr nc,mvse2
+        xor a
+        ld (ENEMY1_ACTIVE),a
+        ld (MAKI_ACTIVE),a
+        ld a,RESPAWN_FRAMES
+        ld (ENEMY1_TIMER),a
+mvse2:
+        ld a,(MAKI_ACTIVE)
+        or a
+        jr z,pvse1
+        ld a,(ENEMY2_ACTIVE)
+        or a
+        jr z,pvse1
+        ld a,(MAKI_X)
+        ld b,a
+        ld a,(ENEMY2_X)
+        call overlap16
+        jr nc,pvse1
+        ld a,(MAKI_Y)
+        ld b,a
+        ld a,ENEMY2_Y
+        call overlap16
+        jr nc,pvse1
+        xor a
+        ld (ENEMY2_ACTIVE),a
+        ld (MAKI_ACTIVE),a
+        ld a,RESPAWN_FRAMES
+        ld (ENEMY2_TIMER),a
+pvse1:
+        ld a,(ENEMY1_ACTIVE)
+        or a
+        jr z,pvse2
+        ld a,(PLAYER_X)
+        ld b,a
+        ld a,(ENEMY1_X)
+        call overlap16
+        jr nc,pvse2
+        ld a,(PLAYER_Y)
+        ld b,a
+        ld a,ENEMY1_Y
+        call overlap16
+        jr nc,pvse2
+        call player_hit
+pvse2:
+        ld a,(ENEMY2_ACTIVE)
+        or a
+        ret z
+        ld a,(PLAYER_X)
+        ld b,a
+        ld a,(ENEMY2_X)
+        call overlap16
+        ret nc
+        ld a,(PLAYER_Y)
+        ld b,a
+        ld a,ENEMY2_Y
+        call overlap16
+        ret nc
+        call player_hit
+        ret
+
+; ------------------------------------------------------------
+; Player got hit by an enemy: knock back to the start position.
+; (No lives/health UI yet -- that's tracked for a later milestone.)
+; ------------------------------------------------------------
+player_hit:
+        ld a,PLAYER_START_X
+        ld (PLAYER_X),a
+        ld a,GROUND_Y
+        ld (PLAYER_Y),a
+        xor a
+        ld (PLAYER_VY),a
+        ld a,1
+        ld (PLAYER_ONGROUND),a
+        ret
+
+; ------------------------------------------------------------
 ; Write sprite attribute entries: jajamaru (red+white layers),
 ; then the makibishi if in flight, then a terminator.
 ; ------------------------------------------------------------
@@ -288,6 +517,30 @@ update_sprite_attr:
         ld a,0x0e
         out (VDP_DATA),a        ; color 14 = gray
 no_maki:
+        ld a,(ENEMY1_ACTIVE)
+        or a
+        jr z,no_enemy1
+        ld a,ENEMY1_Y
+        out (VDP_DATA),a
+        ld a,(ENEMY1_X)
+        out (VDP_DATA),a
+        ld a,12
+        out (VDP_DATA),a        ; pattern number 12 (frog quadrants 0-3)
+        ld a,0x02
+        out (VDP_DATA),a        ; color 2 = medium green
+no_enemy1:
+        ld a,(ENEMY2_ACTIVE)
+        or a
+        jr z,no_enemy2
+        ld a,ENEMY2_Y
+        out (VDP_DATA),a
+        ld a,(ENEMY2_X)
+        out (VDP_DATA),a
+        ld a,16
+        out (VDP_DATA),a        ; pattern number 16 (ghost quadrants 0-3)
+        ld a,0x0d
+        out (VDP_DATA),a        ; color 13 = magenta
+no_enemy2:
         ld a,0xd0               ; terminator
         out (VDP_DATA),a
         ret
@@ -373,7 +626,7 @@ load_sprite_pattern:
         ld hl,0x0800
         call vram_set_addr_write
         ld hl,sprite_gfx
-        ld b,72
+        ld b,sprite_gfx_end-sprite_gfx
 sprite_gfx_loop:
         ld a,(hl)
         out (VDP_DATA),a
@@ -401,10 +654,18 @@ vdp_init_table:
         db 0x07                  ; R7: backdrop color = cyan
 vdp_init_table_end:
 
-; jajamaru 16x16 sprite, two 32-byte color layers (4 quadrants each:
-; top-left, bottom-left, top-right, bottom-right). Derived from
-; assets/jajamaru_final_16x16.png (see tools/sprite_to_asm.py).
-; Followed by an 8-byte single-tile makibishi (caltrop) pattern.
+; Sprite patterns. Because R1's SI bit selects 16x16 sprites for the
+; *whole* VDP, every sprite here -- even visually 8x8/16x8 ones --
+; occupies a full quadruple of 4 consecutive pattern numbers (TL,BL,
+; TR,BR); unused quadrants are left as zero (blank/transparent) and
+; explicitly zero-padded below so later entries land on the next
+; multiple of 4.
+;
+; jajamaru 16x16 (patterns 0-3 red layer, 4-7 white layer). Derived
+; from assets/jajamaru_final_16x16.png (see tools/sprite_to_asm.py).
+; makibishi caltrop (8-11, only TL used). frog enemy 16x16 (12-15,
+; from assets/enemies/enemy_frog_fc.png). ghost enemy (16-19, only
+; TL/TR used, from assets/enemies/enemy_ghost_fc.png).
 sprite_gfx:
         ; -- red layer (patterns 0-3) --
         db 0x03,0x1f,0x3f,0x20,0x20,0x20,0xe0,0xff   ; top-left
@@ -416,7 +677,21 @@ sprite_gfx:
         db 0x00,0x00,0x00,0x07,0x00,0x00,0x3e,0x00   ; bottom-left
         db 0x00,0x00,0x00,0x80,0xc0,0xc0,0xc0,0x00   ; top-right
         db 0x00,0x03,0x02,0xf0,0x04,0x04,0x1c,0x00   ; bottom-right
-        ; -- makibishi (pattern 8) --
-        db 0x18,0x3c,0x7e,0xff,0xff,0x7e,0x3c,0x18
+        ; -- makibishi (patterns 8-11, only TL=8 used) --
+        db 0x18,0x3c,0x7e,0xff,0xff,0x7e,0x3c,0x18   ; TL
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; BL (unused)
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; TR (unused)
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; BR (unused)
+        ; -- frog enemy (patterns 12-15) --
+        db 0x07,0x0f,0x0f,0x1f,0x3f,0x0f,0xf3,0xfc   ; top-left
+        db 0x00,0x00,0x00,0x70,0x3c,0x79,0xf0,0xf9   ; bottom-left
+        db 0x70,0x98,0x98,0x9e,0xfc,0xfe,0xff,0xff   ; top-right
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x80,0xc0   ; bottom-right
+        ; -- ghost enemy (patterns 16-19, only TL=16/TR=18 used) --
+        db 0x06,0x0d,0x1b,0x07,0x06,0x07,0x1b,0x10   ; TL (left tile)
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; BL (unused)
+        db 0xe0,0xf8,0xf8,0xfc,0x1c,0xfc,0x78,0x38   ; TR (right tile)
+        db 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00   ; BR (unused)
+sprite_gfx_end:
 
         ds 0x2000-$,0xff         ; pad to 8KB
