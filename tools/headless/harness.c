@@ -59,6 +59,8 @@ static void parse_pad_program(const char *s) {
                 case 'D': pad &= ~0x02; break;
                 case 'L': pad &= ~0x04; break;
                 case 'R': pad &= ~0x08; break;
+                case 'J': pad &= ~0x10; break;  /* Button1: jump */
+                case 'T': pad &= ~0x20; break;  /* Button2: throw makibishi */
             }
             s++;
         }

@@ -1,12 +1,20 @@
 ; ============================================================
-; Ninja Jajamaru-kun SG-1000 port - M2: minimal moving-character
-; skeleton. VDP runs in "Screen 1.5" (Graphics II with pattern/
-; color tables collapsed to a single 2KB bank each, see
-; docs/tech_notes/screen1_5.md). Per-frame update is driven by
-; the VBlank interrupt (IM1, fixed vector 0x0038), mirroring the
-; H.TIMI-hook-driven architecture found in the MSX original
-; (docs/msx_analysis/structure.md). Graphics here are placeholder
-; programmer art -- final art is decided in M3.
+; Ninja Jajamaru-kun SG-1000 port - M4: platformer movement
+; (gravity/jump/ground collision) + makibishi throw. VDP runs in
+; "Screen 1.5" (Graphics II with pattern/color tables collapsed to
+; a single 2KB bank each, see docs/tech_notes/screen1_5.md).
+; Per-frame update is driven by the VBlank interrupt (IM1, fixed
+; vector 0x0038), mirroring the H.TIMI-hook-driven architecture
+; found in the MSX original (docs/msx_analysis/structure.md).
+; Player/enemy/tile graphics are the candidates approved in M3
+; (assets/jajamaru_final_16x16.png, assets/enemies/*_fc.png,
+; assets/tiles/tile_brick_fc.png -- background tiles here still
+; use the M2 placeholder ground strip pending M4/M5 level work).
+;
+; Known hardware limitation: TMS9918 sprites cannot be flipped
+; horizontally, so jajamaru's sprite always faces the same way
+; regardless of movement direction; only the makibishi's throw
+; direction tracks facing.
 ; ============================================================
 
 VDP_DATA        equ 0xbe
@@ -16,11 +24,25 @@ PAD1_PORT       equ 0xdc
 ; work RAM (mirrored 1KB at 0xC000-0xC3FF)
 PLAYER_X        equ 0xc000
 PLAYER_Y        equ 0xc001
+PLAYER_VY       equ 0xc002      ; signed, pixels/frame
+PLAYER_ONGROUND equ 0xc003
+PLAYER_FACING   equ 0xc004      ; 0 = right, 1 = left
+PAD_PREV        equ 0xc005      ; previous frame's pad bits, for edge detection
+MAKI_ACTIVE     equ 0xc006
+MAKI_X          equ 0xc007
+MAKI_Y          equ 0xc008
+MAKI_DIR        equ 0xc009
 
 SPRITE_ATTR_BASE equ 0x1b00
 
 PLAYER_X_MAX    equ 239   ; 256 - 16 (sprite width) - 1
-PLAYER_Y_MAX    equ 175   ; 192 - 16 (sprite height) - 1
+GROUND_Y        equ 160   ; 176 (ground tile top) - 16 (sprite height)
+JUMP_VY         equ 0xf6   ; -10 as two's complement
+GRAVITY         equ 1
+MAX_FALL_VY     equ 4
+MAKI_SPEED      equ 3
+MAKI_X_MIN      equ 0
+MAKI_X_MAX      equ 248
 
         org 0x0000
         di
@@ -66,11 +88,18 @@ clear_loop:
         call load_name_table
         call load_sprite_pattern
 
-        ; initial player position
+        ; initial player/state
         ld a,112
         ld (PLAYER_X),a
-        ld a,80
+        ld a,GROUND_Y
         ld (PLAYER_Y),a
+        xor a
+        ld (PLAYER_VY),a
+        ld (PLAYER_FACING),a
+        ld (PAD_PREV),a
+        ld (MAKI_ACTIVE),a
+        ld a,1
+        ld (PLAYER_ONGROUND),a
         call update_sprite_attr
 
         ; enable display + VBlank interrupt (R1: 16K=1,BLANK=1,IE=1,SI=1)
@@ -89,24 +118,8 @@ hang:
 ; ------------------------------------------------------------
 frame_update:
         in a,(PAD1_PORT)
-        ld c,a                  ; c = pad bits (active low)
+        ld c,a                  ; c = this frame's pad bits (active low)
 
-        bit 0,c                 ; Up
-        jr nz,chk_down
-        ld a,(PLAYER_Y)
-        or a
-        jr z,chk_down
-        dec a
-        ld (PLAYER_Y),a
-chk_down:
-        bit 1,c                 ; Down
-        jr nz,chk_left
-        ld a,(PLAYER_Y)
-        cp PLAYER_Y_MAX
-        jr nc,chk_left
-        inc a
-        ld (PLAYER_Y),a
-chk_left:
         bit 2,c                 ; Left
         jr nz,chk_right
         ld a,(PLAYER_X)
@@ -114,20 +127,132 @@ chk_left:
         jr z,chk_right
         dec a
         ld (PLAYER_X),a
+        ld a,1
+        ld (PLAYER_FACING),a
 chk_right:
         bit 3,c                 ; Right
-        jr nz,frame_update_done
+        jr nz,chk_jump
         ld a,(PLAYER_X)
         cp PLAYER_X_MAX
-        jr nc,frame_update_done
+        jr nc,chk_jump
         inc a
         ld (PLAYER_X),a
-frame_update_done:
+        xor a
+        ld (PLAYER_FACING),a
+chk_jump:
+        ; Jump on Button1 (bit4) rising edge, only while on ground
+        ld a,(PAD_PREV)
+        bit 4,a
+        jr z,chk_throw          ; was already held last frame -> not a new press
+        bit 4,c
+        jr nz,chk_throw         ; not held now either
+        ld a,(PLAYER_ONGROUND)
+        or a
+        jr z,chk_throw
+        ld a,JUMP_VY
+        ld (PLAYER_VY),a
+        xor a
+        ld (PLAYER_ONGROUND),a
+chk_throw:
+        ; Throw makibishi on Button2 (bit5) rising edge, only if none in flight
+        ld a,(PAD_PREV)
+        bit 5,a
+        jr z,apply_gravity
+        bit 5,c
+        jr nz,apply_gravity
+        ld a,(MAKI_ACTIVE)
+        or a
+        jr nz,apply_gravity
+        call spawn_makibishi
+apply_gravity:
+        ld a,(PLAYER_ONGROUND)
+        or a
+        jr nz,update_maki       ; already resting on the ground -- nothing to do
+        ld a,(PLAYER_VY)
+        add a,GRAVITY
+        cp MAX_FALL_VY+1
+        jr nz,vy_stored
+        ld a,MAX_FALL_VY
+vy_stored:
+        ld (PLAYER_VY),a
+        ld e,a
+        ld a,(PLAYER_Y)
+        add a,e
+        ld (PLAYER_Y),a
+        cp GROUND_Y+1
+        jr c,update_maki        ; still airborne
+        ld a,GROUND_Y
+        ld (PLAYER_Y),a
+        xor a
+        ld (PLAYER_VY),a
+        ld a,1
+        ld (PLAYER_ONGROUND),a
+update_maki:
+        call update_makibishi
+
+        ld a,c
+        ld (PAD_PREV),a
         call update_sprite_attr
         ret
 
 ; ------------------------------------------------------------
-; Write the player's sprite attribute entry (Y,X,pattern,color)
+; Launch a makibishi from the player's position, in the direction
+; jajamaru is currently facing.
+; ------------------------------------------------------------
+spawn_makibishi:
+        ld a,1
+        ld (MAKI_ACTIVE),a
+        ld a,(PLAYER_FACING)
+        ld (MAKI_DIR),a
+        ld a,(PLAYER_Y)
+        add a,4
+        ld (MAKI_Y),a
+        ld a,(MAKI_DIR)
+        or a
+        jr nz,spawn_left
+        ld a,(PLAYER_X)
+        add a,16
+        ld (MAKI_X),a
+        ret
+spawn_left:
+        ld a,(PLAYER_X)
+        sub 8
+        ld (MAKI_X),a
+        ret
+
+; ------------------------------------------------------------
+; Move the in-flight makibishi (if any); deactivate it once it
+; flies off either edge of the screen.
+; ------------------------------------------------------------
+update_makibishi:
+        ld a,(MAKI_ACTIVE)
+        or a
+        ret z
+        ld a,(MAKI_DIR)
+        or a
+        jr nz,maki_move_left
+        ld a,(MAKI_X)
+        add a,MAKI_SPEED
+        ld (MAKI_X),a
+        cp MAKI_X_MAX
+        jr c,maki_done
+        xor a
+        ld (MAKI_ACTIVE),a
+        ret
+maki_move_left:
+        ld a,(MAKI_X)
+        sub MAKI_SPEED
+        ld (MAKI_X),a
+        cp MAKI_X_MIN
+        jr nc,maki_done
+        xor a
+        ld (MAKI_ACTIVE),a
+maki_done:
+        ret
+
+; ------------------------------------------------------------
+; Write sprite attribute entries: jajamaru (red+white layers),
+; then the makibishi if in flight, then a terminator.
 ; ------------------------------------------------------------
 update_sprite_attr:
         ld hl,SPRITE_ATTR_BASE
@@ -150,7 +275,20 @@ update_sprite_attr:
         out (VDP_DATA),a        ; pattern number 4 (white quadrants 0-3)
         ld a,0x0f
         out (VDP_DATA),a        ; color 15 = white
-        ld a,0xd0               ; terminator (stop list after 2 sprites)
+
+        ld a,(MAKI_ACTIVE)
+        or a
+        jr z,no_maki
+        ld a,(MAKI_Y)
+        out (VDP_DATA),a
+        ld a,(MAKI_X)
+        out (VDP_DATA),a
+        ld a,8
+        out (VDP_DATA),a        ; pattern number 8 (makibishi)
+        ld a,0x0e
+        out (VDP_DATA),a        ; color 14 = gray
+no_maki:
+        ld a,0xd0               ; terminator
         out (VDP_DATA),a
         ret
 
@@ -225,9 +363,9 @@ nt_ground_loop:
         ret
 
 ; ------------------------------------------------------------
-; Sprite pattern: jajamaru, 16x16, built from two overlapping
-; single-color sprites (TMS9918 sprites are always one flat color
-; each): patterns 0-3 = red layer, patterns 4-7 = white layer.
+; Sprite patterns: jajamaru (16x16, red+white layers built from
+; two overlapping single-color sprites -- TMS9918 sprites are
+; always one flat color each) plus a small makibishi projectile.
 ; Black/cutout areas are simply 0 bits in both layers, showing the
 ; background through (per the reference art: red+white, black=cutout).
 ; ------------------------------------------------------------
@@ -235,7 +373,7 @@ load_sprite_pattern:
         ld hl,0x0800
         call vram_set_addr_write
         ld hl,sprite_gfx
-        ld b,64
+        ld b,72
 sprite_gfx_loop:
         ld a,(hl)
         out (VDP_DATA),a
@@ -266,6 +404,7 @@ vdp_init_table_end:
 ; jajamaru 16x16 sprite, two 32-byte color layers (4 quadrants each:
 ; top-left, bottom-left, top-right, bottom-right). Derived from
 ; assets/jajamaru_final_16x16.png (see tools/sprite_to_asm.py).
+; Followed by an 8-byte single-tile makibishi (caltrop) pattern.
 sprite_gfx:
         ; -- red layer (patterns 0-3) --
         db 0x03,0x1f,0x3f,0x20,0x20,0x20,0xe0,0xff   ; top-left
@@ -277,5 +416,7 @@ sprite_gfx:
         db 0x00,0x00,0x00,0x07,0x00,0x00,0x3e,0x00   ; bottom-left
         db 0x00,0x00,0x00,0x80,0xc0,0xc0,0xc0,0x00   ; top-right
         db 0x00,0x03,0x02,0xf0,0x04,0x04,0x1c,0x00   ; bottom-right
+        ; -- makibishi (pattern 8) --
+        db 0x18,0x3c,0x7e,0xff,0xff,0x7e,0x3c,0x18
 
         ds 0x2000-$,0xff         ; pad to 8KB
