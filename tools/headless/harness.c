@@ -148,16 +148,21 @@ static void render_screen(void) {
             }
         }
     } else if (m3 && !m1 && !m2) {
-        /* Graphics II */
-        int pattern_base = (vdpreg[4] & 0x04) ? 0x2000 : 0x0000;
-        int color_base = (vdpreg[3] & 0x80) ? 0x2000 : 0x0000;
+        /* Graphics II (also covers the "Screen 1.5" hybrid: R3/R4 low-bit
+         * masks can collapse the 3 name-table thirds onto a single 2KB
+         * pattern/color bank, giving Graphics-I-sized tables with
+         * Graphics-II per-scanline color resolution). Formula verified
+         * against the vrEmuTms9918 reference emulator implementation. */
+        int pattern_base = (vdpreg[4] & 0x04) << 11;
+        int color_base = (vdpreg[3] & 0x80) << 6;
         for (int row = 0; row < 24; row++) {
-            int third = row / 8; /* 0,1,2 selects 2KB block within pattern/color tables */
+            int third = (row >> 3) & (vdpreg[4] & 0x03);      /* masked by R4 bits0-1 */
+            int patt_off = third << 11;
+            int color_off = patt_off & ((vdpreg[3] & 0x60) << 6); /* masked by R3 bits5-6 */
             for (int col = 0; col < 32; col++) {
                 unsigned char code = vram[name_base + row * 32 + col];
-                int block_off = third * 0x800;
-                int pat_addr = (pattern_base + block_off + code * 8) & 0x3FFF;
-                int col_addr = (color_base + block_off + code * 8) & 0x3FFF;
+                int pat_addr = (pattern_base + patt_off + code * 8) & 0x3FFF;
+                int col_addr = (color_base + color_off + code * 8) & 0x3FFF;
                 for (int line = 0; line < 8; line++) {
                     unsigned char patbyte = vram[(pat_addr + line) & 0x3FFF];
                     unsigned char colbyte = vram[(col_addr + line) & 0x3FFF];
